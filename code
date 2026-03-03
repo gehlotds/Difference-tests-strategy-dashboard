@@ -1,0 +1,1604 @@
+# ============================================================
+# DISCRIMINATION STRATEGY STUDIO
+# Sensory Psychophysics + Business Decision Layer
+# ============================================================
+
+install.packages(c("shiny","shinydashboard","plotly","DT","shinyWidgets"))
+
+library(shiny)
+library(shinydashboard)
+library(plotly)
+library(DT)
+library(shinyWidgets)
+
+# ============================================================
+# SECTION 1 — CONSTANTS
+# ============================================================
+
+# Method-to-context recommendation rules (simple heuristic)
+METHOD_CONTEXT_FIT <- list(
+  "2AFC"     = "Best for: copy-exact, cost-saving. Most efficient for a named directional attribute. Avoid when the relevant attribute is unknown.",
+  "3AFC"     = "Best for: cost-saving, exploratory. Higher power than 2AFC when no attribute is pre-specified. Avoid for copy-exact if attribute is known.",
+  "Triangle" = "AVOID for copy-exact: strategy shifts (Tau-COD to Beta) inflate Type I error and make d' unreliable. Prefer Tetrad or 2AFC for subtle differences. Acceptable for exploratory screening.",
+  "Tetrad"   = "Best for: cost-saving with subtle differences. Higher power per session than Triangle. Requires trained panelists. Good alternative to Triangle for all contexts.",
+  "Duo-Trio" = "Best for: supplier change when reference is physically available during testing. Less statistically efficient than 2AFC; avoid for copy-exact where sensitivity is paramount.",
+  "A-not-A"  = "Best for: supplier change, exploratory, with a trained panel that has internalised the reference. Avoid when panelists are unfamiliar with the standard — criterion placement becomes unreliable."
+)
+
+TEST_DATA <- list(
+  "2AFC" = list(
+    test_name = "2AFC",
+    objective = "Which of the two products is more intense?",
+    reference_product = "No", samples_per_trial = 2, possible_sequences = 2,
+    sequence_series = "AB, BA", variance_sequence = "Low", memory_effect = "Low",
+    cognitive_strategy = "Beta strategy. Most statistically efficient directional test for a named attribute. Use when the attribute driving difference is known.",
+    example = "Panelist identifies which of two samples has stronger sweetness.",
+    pc = 1/2, model = "Thurstonian"
+  ),
+  "3AFC" = list(
+    test_name = "3AFC",
+    objective = "Which of the three products is most intense?",
+    reference_product = "No", samples_per_trial = 3, possible_sequences = 3,
+    sequence_series = "AAB, ABA, BAA", variance_sequence = "Medium", memory_effect = "Low",
+    cognitive_strategy = "Beta strategy. Higher power than 2AFC at same n when the relevant attribute is not pre-specified.",
+    example = "Panelist identifies which of three samples has the strongest aroma.",
+    pc = 1/3, model = "Thurstonian"   # exact 1/3, not 0.333
+  ),
+  "Triangle" = list(
+    test_name = "Triangle",
+    objective = "Which of the three products is different from the other two?",
+    reference_product = "No", samples_per_trial = 3, possible_sequences = 6,
+    sequence_series = "AAB, ABA, BAA, BBA, BAB, ABB",
+    variance_sequence = "High", memory_effect = "High",
+    cognitive_strategy = "Tau-COD strategy. Re-tasting causes strategy shifts to Beta — d' estimates become unreliable for highly similar products. Avoid for subtle differences.",
+    example = "Panelist receives three samples (two identical, one different) and identifies the odd one.",
+    pc = 1/3, model = "Thurstonian"   # exact 1/3, not 0.333
+  ),
+  "Tetrad" = list(
+    test_name = "Tetrad",
+    objective = "Group four samples into two pairs of identical products.",
+    reference_product = "No", samples_per_trial = 4, possible_sequences = 6,
+    sequence_series = "AABB, ABAB, ABBA, BAAB, BABA, BBAA",
+    variance_sequence = "High", memory_effect = "High",
+    cognitive_strategy = "Complex multi-comparison task. Higher power per session than Triangle. Preferred when small differences are expected and panelists are trained.",
+    example = "Four juice cups (2xA, 2xB) — group them into matching pairs.",
+    pc = 1/6, model = "Thurstonian"   # exact 1/6, not 0.167
+  ),
+  "Duo-Trio" = list(
+    test_name = "Duo-Trio",
+    objective = "Which of the two samples matches the reference?",
+    # Constant-reference variant modelled here: R always presented first.
+    # 2 sequences only (RAB, RBA). Balanced-reference (6 sequences) is a
+    # different design with different memory and variance properties.
+    reference_product = "Yes", samples_per_trial = 3, possible_sequences = 2,
+    sequence_series = "RAB, RBA  (constant-reference design — R always first)",
+    variance_sequence = "Medium", memory_effect = "Low",
+    cognitive_strategy = "Constant-reference mode: R is always presented first, reducing criterion variability. Less statistically efficient than 2AFC. Use when the reference product is physically available during the test. Note: balanced-reference Duo-Trio (6 sequences, R in any position) is a different, less efficient procedure.",
+    example = "Panelist tastes reference R first, then identifies which of A or B matches R.",
+    pc = 1/2, model = "Thurstonian"
+  ),
+  "A-not-A" = list(
+    test_name = "A-not-A",
+    objective = "Is this product the same or different from the reference?",
+    reference_product = "Yes", samples_per_trial = 1, possible_sequences = 2,
+    sequence_series = "AA, AB", variance_sequence = "Low", memory_effect = "Medium",
+    cognitive_strategy = "Beta strategy when subjects are familiar with the reference (criterion placed at internalised standard). Without familiarity, criterion placement is unreliable. Modelled via SDT: d' = z(pa) where pa is the hit rate on signal trials.",
+    example = "Panelist compares one sample against an internalised reference and judges same or different.",
+    pc = 1/2, model = "SDT"
+  )
+)
+
+# Decision context presets: the "five fingers" per business scenario
+CONTEXTS <- list(
+  "copy_exact" = list(
+    label = "Copy-Exact / Brand Protection",
+    d_R = 0.5, alpha = 0.05, target_power = 0.90,
+    cost_miss = 15, cost_alarm = 3,
+    description = "Any undetected difference risks consumer complaint. Very low tolerance for missed differences. Larger n is justified."
+  ),
+  "cost_saving" = list(
+    label = "Cost-Saving Reformulation",
+    d_R = 0.8, alpha = 0.05, target_power = 0.80,
+    cost_miss = 8, cost_alarm = 5,
+    description = "Balanced stakes. A missed consumer-noticeable difference can damage the brand; a false alarm wastes reformulation investment."
+  ),
+  "supplier_change" = list(
+    label = "Supplier / Process Change",
+    d_R = 1.0, alpha = 0.10, target_power = 0.80,
+    cost_miss = 6, cost_alarm = 8,
+    description = "Operational change. Somewhat larger differences are acceptable. False alarms unnecessarily block the supply chain."
+  ),
+  "exploratory" = list(
+    label = "Exploratory R&D",
+    d_R = 1.2, alpha = 0.10, target_power = 0.70,
+    cost_miss = 3, cost_alarm = 3,
+    description = "Early-stage screening. Symmetric error costs. Conservative n to preserve panel time."
+  )
+)
+
+# C1 fix: single source of truth for strategy names — used in calc_strategy_table,
+# ds_loss_curve, and any other lookup. Changing here propagates everywhere.
+STRAT_NAMES <- c(
+  "NHST (no sig. diff.)",
+  "Equivalence (CI < d_R)",
+  "Bayesian P(d'<d_R) [flat prior]"
+)
+
+# ============================================================
+# SECTION 2 — STATISTICAL ENGINE
+# ============================================================
+
+calc_se <- function(n, pa, pc, test_name) {
+  pa     <- max(pc + 1e-6, min(0.9999, pa))
+  phi_pa <- dnorm(qnorm(pa))
+  if (test_name %in% c("Triangle", "Duo-Trio")) {
+    phi_pc <- dnorm(qnorm(pc))
+    sqrt((phi_pa^2 * pa * (1 - pa)) / (n * (phi_pa^2 + phi_pc^2)))
+  } else {
+    sqrt((pa * (1 - pa)) / (n * phi_pa^2))
+  }
+}
+
+calc_d_prime <- function(n, x, test_data) {
+  if (n <= 0 || x < 0 || x > n) return(list(d_prime = NA, se = NA, pa = NA))
+  pa   <- x / n
+  pc   <- test_data$pc
+  name <- test_data$test_name
+  if (pa <= pc) pa <- pc + 0.001
+  if (pa >= 1)  pa <- 0.999
+  d <- switch(name,
+              # A-not-A: yes/no task against internalised criterion.
+              # SDT formula: d' = z(pa) — NO sqrt(2) factor.
+              # sqrt(2) belongs to 2AFC (decision variable = difference of two N(0,1)).
+              "A-not-A" = qnorm(pa),
+              # 2AFC: d' = sqrt(2) * z(pa)  — standard Thurstonian 2AFC result
+              "2AFC"    = qnorm(pa) * sqrt(2),
+              # 3AFC: 1.128 is the Ashby & Townsend (1986) approximation valid near pc.
+              # Exact relationship requires numerical integration (cf. sensR::pc2dp).
+              "3AFC"    = qnorm(pa) * sqrt(2) * 1.128,
+              # Triangle: non-directional; d' = z(pa) - z(pc) (Thurstonian / Stanislaw & Todorov)
+              "Triangle"= qnorm(pa) - qnorm(pc),
+              # Tetrad: 1.414 approximation (Ennis 2012). Exact via numerical integration.
+              "Tetrad"  = qnorm(pa) * sqrt(2) * 1.414,
+              # Duo-Trio (constant-reference): same decision structure as 2AFC; d' = z(pa) - z(pc)
+              "Duo-Trio"= qnorm(pa) - qnorm(pc)
+  )
+  # SE formulas:
+  # A-not-A (SDT yes/no): SE = 1 / (sqrt(n) * phi(z_pa))
+  # This follows from the MLE delta method for a single-sample SDT task.
+  # It differs from the 2AFC SE because A-not-A has only one observation per trial,
+  # not a difference of two.
+  se <- if (name == "A-not-A")
+    1 / (sqrt(n) * dnorm(qnorm(pa)))
+  else
+    calc_se(n, pa, pc, name)
+  list(d_prime = d, se = se, pa = pa)
+}
+
+pa_from_d <- function(d, test_name, pc) {
+  switch(test_name,
+         # A-not-A: d' = qnorm(pa)  →  pa = pnorm(d)   [no sqrt(2)]
+         "A-not-A" = pnorm(d),
+         # 2AFC:    d' = sqrt(2)*qnorm(pa)  →  pa = pnorm(d/sqrt(2))
+         "2AFC"    = pnorm(d / sqrt(2)),
+         "3AFC"    = pnorm(d / (sqrt(2) * 1.128)),
+         "Triangle"= pnorm(qnorm(pc) + d),
+         "Tetrad"  = pnorm(d / (sqrt(2) * 1.414)),
+         "Duo-Trio"= pnorm(qnorm(pc) + d)
+  )
+}
+
+# Exact binomial power
+calc_power <- function(n, d, test_name, pc, alpha = 0.05) {
+  if (n < 1 || d <= 0) return(0)
+  pa_true <- pa_from_d(d, test_name, pc)
+  x_crit  <- qbinom(1 - alpha, n, pc) + 1
+  1 - pbinom(x_crit - 1, n, pa_true)
+}
+
+calc_min_n <- function(d, test_name, pc, alpha = 0.05, power_target = 0.80) {
+  for (n in 5:500) if (calc_power(n, d, test_name, pc, alpha) >= power_target) return(n)
+  return(NA)
+}
+
+calc_ci <- function(d_prime, se, pa, n, pc) {
+  z     <- qnorm(0.975)
+  se_pa <- sqrt(pa * (1 - pa) / n)
+  list(
+    d_ci  = c(d_prime - z * se, d_prime + z * se),
+    pa_ci = c(max(0, pa - z * se_pa), min(1, pa + z * se_pa)),
+    pd    = pa - pc,
+    pd_ci = c(max(0, pa - z * se_pa - pc), min(1 - pc, pa + z * se_pa - pc))
+  )
+}
+
+# ------------------------------------------------------------------
+# PRINCIPLED decision-strategy layer
+#
+# NHST    : approves when no significant difference from zero
+#           (pure significance logic — d_R is irrelevant here)
+# Equiv.  : approves when CI upper < d_R (TOST-style)
+# Bayesian: P(d' < d_R | data) — flat prior, posterior ~ N(d', SE^2)
+#
+# All approval probs use a smooth logistic mapping so that
+# expected-loss curves are continuous near boundaries.
+#
+# p_sim  = P(d' < d_R | data)   [likelihood-based posterior, flat prior]
+# p_diff = 1 - p_sim
+# Expected loss = cost_miss * p_diff * p_approve
+#               + cost_alarm * p_sim  * (1 - p_approve)
+# ------------------------------------------------------------------
+calc_strategy_table <- function(d_prime, se, d_R, alpha, cost_miss, cost_alarm) {
+  
+  # z levels:
+  #   z_nhst  — one-tailed critical value used for NHST significance test (H0: d'=0, HA: d'>0)
+  #   z_ci    — two-tailed 95% CI multiplier (alpha=0.05 regardless of context alpha,
+  #             because CIs are always reported at 95% for interpretability)
+  z_nhst   <- qnorm(1 - alpha)        # one-tailed: depends on context alpha
+  z_ci     <- qnorm(0.975)            # two-tailed: always 95% CI
+  
+  ci_upper <- d_prime + z_ci * se
+  ci_lower <- d_prime - z_ci * se
+  
+  # Posterior probability under flat prior: P(d' < d_R | data) ~ N(d_prime, se^2)
+  p_sim  <- pnorm(d_R, mean = d_prime, sd = se)
+  p_diff <- 1 - p_sim
+  
+  # ---------------------------------------------------------------------------
+  # Smooth logistic approval probabilities.
+  # Margins are clamped to [-10, 10] before plogis to avoid Inf/-Inf overflow
+  # when SE is very small (e.g. large N) or d_prime is far from boundary.
+  # plogis(margin) → 1 when margin >> 0 (strong approval),
+  #                  0 when margin << 0 (strong rejection),
+  #                  0.5 when exactly on the boundary.
+  # ---------------------------------------------------------------------------
+  
+  # NHST: approve when the test fails to reject H0 (d' not significantly > 0).
+  # Margin = how far the lower 95% CI bound lies above zero.
+  # Positive margin → lower CI > 0 → significant (lean reject).
+  # We want P(Approve) high when NOT significant, so we negate:
+  # nhst_margin > 0 means "lower CI above 0" i.e. sig diff → reject.
+  # Therefore: nhst_approve = plogis(-nhst_margin).
+  # Equivalently: nhst_approve = plogis((0 - ci_lower) / se).
+  # Note: NHST deliberately ignores d_R. Equivalence carries the d_R logic.
+  nhst_margin  <- clamp((ci_lower - 0) / se, -10, 10)   # positive = sig diff
+  nhst_approve <- plogis(-nhst_margin)                   # negate: high when not sig
+  
+  # Equivalence (TOST-style): approve when the 95% CI lies entirely below d_R.
+  # Rule: ci_upper < d_R  ↔  d_R - ci_upper > 0.
+  # Margin = (d_R - ci_upper) / se: positive when CI upper is safely below d_R.
+  equiv_margin  <- clamp((d_R - ci_upper) / se, -10, 10)
+  equiv_approve <- plogis(equiv_margin)
+  
+  # Bayesian (flat prior): P(d' < d_R | data) is directly the approval weight.
+  # No logistic needed — the probability is already continuous and bounded [0,1].
+  bayes_approve <- p_sim
+  
+  strats    <- STRAT_NAMES   # single source of truth — also used in ds_loss_curve
+  p_app_vec <- c(nhst_approve, equiv_approve, bayes_approve)
+  
+  rows <- lapply(seq_along(strats), function(i) {
+    pa   <- p_app_vec[i]
+    pr   <- 1 - pa
+    loss <- cost_miss * p_diff * pa + cost_alarm * p_sim * pr
+    data.frame(
+      Strategy              = strats[i],
+      "P(d' < d_R)"         = round(p_sim,       3),
+      "P(Approve)"          = round(pa,          3),
+      "P(App. & Diff.)"     = round(p_diff * pa, 3),
+      "P(Rej. & Similar)"   = round(p_sim  * pr, 3),
+      "Expected Loss"       = round(loss,        2),
+      check.names = FALSE, stringsAsFactors = FALSE
+    )
+  })
+  do.call(rbind, rows)
+}
+
+# Helper: clamp x to [lo, hi]
+clamp <- function(x, lo, hi) pmax(lo, pmin(hi, x))
+
+best_strategy_name <- function(df) df$Strategy[which.min(df$`Expected Loss`)]
+
+# Consumer-relevant verdict (CI vs d_R)
+verdict_text <- function(d_prime, se, d_R) {
+  if (is.na(d_prime)) return(list(text = "No data", color = "gray", detail = "Enter N and X.", p_below = NA))
+  ci_lo   <- d_prime - qnorm(0.975) * se
+  ci_hi   <- d_prime + qnorm(0.975) * se
+  p_below <- pnorm(d_R, d_prime, se)   # flat-prior posterior
+  if (ci_hi < d_R)
+    list(text    = "Within consumer tolerance",
+         color   = "green",
+         p_below = p_below,
+         detail  = paste0(
+           "95% CI [", round(ci_lo, 2), ", ", round(ci_hi, 2), "] lies entirely below ",
+           "the consumer-relevant difference d_R = ", d_R, ". ",
+           "The observed sensory difference is unlikely to be noticeable to consumers."))
+  else if (ci_lo > d_R)
+    list(text    = "Exceeds consumer tolerance",
+         color   = "red",
+         p_below = p_below,
+         detail  = paste0(
+           "95% CI [", round(ci_lo, 2), ", ", round(ci_hi, 2), "] lies entirely above ",
+           "d_R = ", d_R, ". ",
+           "The observed difference is likely noticeable to consumers."))
+  else
+    list(text    = "Inconclusive around d_R",
+         color   = "orange",
+         p_below = p_below,
+         detail  = paste0(
+           "95% CI [", round(ci_lo, 2), ", ", round(ci_hi, 2), "] straddles ",
+           "d_R = ", d_R, ". ",
+           "More panelists are needed to resolve whether the difference is consumer-relevant."))
+}
+
+# Power-at-d_R sentence
+power_sentence <- function(methods, n, d_R, alpha) {
+  parts <- sapply(methods, function(m) {
+    pc <- TEST_DATA[[m]]$pc
+    pw <- calc_power(n, d_R, m, pc, alpha)
+    paste0(m, ": ", round(pw * 100, 1), "%")
+  })
+  paste0("At d_R = ", d_R, " and N = ", n, "  |  ", paste(parts, collapse = "  |  "))
+}
+
+# ============================================================
+# SECTION 3 — UI
+# ============================================================
+
+info_icon <- function(text) {
+  tags$span(
+    style = "color:#aaa; margin-left:5px; cursor:help;",
+    title = text, icon("info-circle")
+  )
+}
+
+ui <- dashboardPage(
+  skin = "blue",
+  dashboardHeader(title = "Discrimination Strategy Studio", titleWidth = 295),
+  
+  dashboardSidebar(
+    width = 245,
+    sidebarMenu(
+      id = "main_tabs",
+      menuItem("Method & Assumptions", tabName = "tab1", icon = icon("flask")),
+      menuItem("Design & Power",       tabName = "tab2", icon = icon("chart-line")),
+      menuItem("Decision Strategy",    tabName = "tab3", icon = icon("balance-scale")),
+      menuItem("Scenario Projector",   tabName = "tab4", icon = icon("layer-group"))
+    ),
+    hr(),
+    h5(tags$span("Global Inputs", style = "color:#bbb;"), style = "padding:0 12px; margin:0;"),
+    div(style = "padding:0 12px;",
+        selectInput("global_method", "Test method",
+                    choices = c("2AFC","3AFC","Triangle","Tetrad","Duo-Trio","A-not-A"),
+                    selected = "2AFC"),
+        numericInput("global_n", "Panelists (N)", value = 80, min = 5, max = 500),
+        numericInput("global_x", "Correct answers (X)", value = 55, min = 0, max = 500)
+    ),
+    hr(),
+    h5(tags$span("Decision Context", style = "color:#bbb;"), style = "padding:0 12px; margin:0;"),
+    div(style = "padding:0 12px;",
+        selectInput("context_type", NULL,
+                    choices = setNames(names(CONTEXTS), sapply(CONTEXTS, `[[`, "label")),
+                    selected = "cost_saving"),
+        materialSwitch("expert_mode", "Expert mode", value = FALSE, status = "info")
+    ),
+    hr(),
+    div(style = "padding:6px 14px; color:#999; font-size:11px; line-height:1.5;",
+        strong("Active context:"), br(),
+        textOutput("sidebar_hint", inline = TRUE))
+  ),
+  
+  dashboardBody(
+    tags$head(tags$style(HTML("
+      /* Context banner */
+      .ctx-card {
+        background:#e8f4fd; border-left:5px solid #2980b9;
+        padding:10px 16px; margin:0 0 14px; border-radius:4px;
+        font-size:13px; line-height:1.6;
+      }
+      /* Verdict tiles */
+      .vrd-green  { background:#dff0d8; border-left:5px solid #3c763d;
+                    padding:12px 14px; border-radius:4px; }
+      .vrd-orange { background:#fcf8e3; border-left:5px solid #8a6d3b;
+                    padding:12px 14px; border-radius:4px; }
+      .vrd-red    { background:#f2dede; border-left:5px solid #a94442;
+                    padding:12px 14px; border-radius:4px; }
+      .vrd-gray   { background:#f5f5f5; border-left:5px solid #aaa;
+                    padding:12px 14px; border-radius:4px; }
+      /* Big number boxes */
+      .num-hero { font-size:28px; font-weight:700; text-align:center;
+                  padding:12px; background:#ecf0f1; border-radius:6px; }
+      /* Strategy best */
+      .best-box { background:#d5f5e3; border-left:5px solid #1e8449;
+                  padding:10px 14px; border-radius:4px; font-size:13px; }
+      /* Stat pre */
+      pre.stat-pre { background:#f9f9f9; border:none; font-size:12.5px;
+                     line-height:1.7; padding:8px; }
+      /* Info note */
+      .info-note { color:#777; font-size:12px; margin-top:6px; font-style:italic; }
+      /* Power sentence */
+      .pw-sentence { background:#f0f8ff; padding:8px 12px; border-radius:4px;
+                     font-size:12.5px; margin-top:6px; }
+    "))),
+    
+    tabItems(
+      
+      # ===================================================
+      # TAB 1 — Method & Assumptions
+      # ===================================================
+      tabItem(
+        tabName = "tab1",
+        
+        # Row 1: context banner
+        fluidRow(
+          column(12, uiOutput("ctx_card_t1"))
+        ),
+        
+        # Row 2: Verdict + Method notes  |  SDT plot (+ optional prior)
+        fluidRow(
+          # --- Verdict (hero) + method fit ---
+          column(
+            width = 6,
+            box(
+              title = tags$span(icon("check-circle"), " Consumer-Relevant Verdict"),
+              status = "success", solidHeader = TRUE, width = NULL,
+              uiOutput("t1_verdict"),
+              br(),
+              div(class = "num-hero", textOutput("t1_d_val")),
+              br(),
+              # Technical details collapsed by default
+              tags$details(
+                tags$summary(
+                  tags$span(
+                    style = "cursor:pointer; font-size:12px; color:#888;",
+                    "Technical statistics \u25bc"
+                  )
+                ),
+                tags$pre(class = "stat-pre", textOutput("t1_stats"))
+              )
+            ),
+            box(
+              title = tags$span(icon("brain"), " When to Use This Method"),
+              status = "primary", solidHeader = TRUE, width = NULL,
+              tableOutput("t1_method_table"),
+              div(class = "info-note", textOutput("t1_method_fit"))
+            )
+          ),
+          
+          # --- SDT plot + optional expert priors ---
+          column(
+            width = 6,
+            box(
+              title = "Signal Detection Model",
+              status = "info", solidHeader = TRUE, width = NULL,
+              plotlyOutput("t1_sdt_plot", height = "270px"),
+              div(
+                class = "info-note",
+                "Blue = noise (reference) distribution. Red = signal (test) distribution. Purple dashed = consumer-relevant d_R. ",
+                "For A-not-A (SDT) this is an exact representation. For Thurstonian methods (2AFC, 3AFC, Triangle, Tetrad, Duo-Trio) the true decision space is more complex — this is a simplified illustration only."
+              )
+            ),
+            conditionalPanel(
+              "input.expert_mode == true",
+              box(
+                title = "Prior Distribution on True d'",
+                status = "warning", solidHeader = TRUE, width = NULL,
+                p(
+                  "Set your belief about where the true d’ lies before testing.",
+                  style = "font-size:12px; color:#666;"
+                ),
+                fluidRow(
+                  column(
+                    6,
+                    sliderInput("prior_mean", "Prior mean d'", 0, 2.0, 0.5, 0.05)
+                  ),
+                  column(
+                    6,
+                    sliderInput("prior_sd", "Prior SD", 0.1, 1.5, 0.4, 0.05)
+                  )
+                ),
+                plotlyOutput("t1_prior_plot", height = "180px"),
+                div(
+                  class = "info-note",
+                  "Note: The Bayesian strategy uses a flat prior (posterior \u221d likelihood). The distribution above is for planning only."
+                )
+              )
+            )
+          )
+        ),
+        
+        # Row 3: Cognitive notes
+        fluidRow(
+          column(
+            12,
+            box(
+              title = "Cognitive Strategy & Psychophysical Notes",
+              status = "info", solidHeader = TRUE, width = NULL,
+              textOutput("t1_cognitive")
+            )
+          )
+        ),
+        
+        # Row 4: Glossary
+        fluidRow(
+          column(
+            width = 12,
+            box(
+              title = "Glossary",
+              status = "primary", solidHeader = TRUE, width = NULL,
+              div(
+                style = "font-size:12px;",
+                tags$table(
+                  class = "table table-striped table-condensed",
+                  tags$thead(
+                    tags$tr(
+                      tags$th("Term"),
+                      tags$th("Definition")
+                    )
+                  ),
+                  tags$tbody(
+                    tags$tr(
+                      tags$td("d’"),
+                      tags$td("Sensitivity index (d-prime). Standardised distance between signal and noise distributions on the latent sensory dimension.")
+                    ),
+                    tags$tr(
+                      tags$td("d_R"),
+                      tags$td("Consumer-relevant difference. The smallest d’ that would be noticeable or meaningful to consumers in the given business context.")
+                    ),
+                    tags$tr(
+                      tags$td("pa"),
+                      tags$td("Proportion correct (observed). pa = X / N.")
+                    ),
+                    tags$tr(
+                      tags$td("pc"),
+                      tags$td("Chance level. The probability of a correct response by random guessing for a given method.")
+                    ),
+                    tags$tr(
+                      tags$td("Pd"),
+                      tags$td("Probability of discrimination. Pd = pa − pc. The proportion of the panel population that is genuinely discriminating.")
+                    ),
+                    tags$tr(
+                      tags$td("SE"),
+                      tags$td("Standard error of d’. Derived via the delta method from the binomial variance of pa.")
+                    ),
+                    tags$tr(
+                      tags$td("P(d’ < d_R | data)"),
+                      tags$td("Consumer-relevant confidence. Probability the true d’ is smaller than d_R under a flat prior on d’.")
+                    ),
+                    tags$tr(
+                      tags$td("NHST"),
+                      tags$td("Null hypothesis significance testing. Tests whether d’ significantly differs from zero. Does not use d_R.")
+                    ),
+                    tags$tr(
+                      tags$td("Equivalence (TOST)"),
+                      tags$td("Two one-sided tests framework. Approves only when the 95% CI for d’ lies entirely below d_R.")
+                    ),
+                    tags$tr(
+                      tags$td("Expected Loss"),
+                      tags$td("Weighted combination of error costs: cost_miss × P(miss) + cost_alarm × P(false alarm).")
+                    ),
+                    tags$tr(
+                      tags$td("Brand safety score"),
+                      tags$td("Synonym for P(d’ < d_R | data) used in the portfolio table. Higher is safer.")
+                    ),
+                    tags$tr(
+                      tags$td("Portfolio brand risk"),
+                      tags$td("Sum of expected loss across High-importance projects. Executive-level KPI.")
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      ,
+      
+      # ===================================================
+      # TAB 2 — Design & Power
+      # ===================================================
+      tabItem(
+        tabName = "tab2",
+        
+        # Row 1: context banner
+        fluidRow(
+          column(12, uiOutput("ctx_card_t2"))
+        ),
+        
+        # Row 2: Power Inputs (left) + Power Curve (right)
+        fluidRow(
+          column(
+            width = 3,
+            box(
+              title = "Power Inputs", status = "warning",
+              solidHeader = TRUE, width = NULL,
+              sliderInput(
+                "pw_alpha",
+                tags$span(
+                  "\u03b1 (Type I error — slider)",
+                  info_icon("EXPLORATION slider: adjusting this changes the power curves and the manual N box, but NOT the 'Min N at context d_R' box below, which always uses the context alpha. This lets you explore sensitivity without losing the context anchor.")
+                ),
+                0.01, 0.20, 0.05, 0.01
+              ),
+              sliderInput(
+                "pw_power",
+                tags$span("Target power (1−\u03b2)", info_icon("Probability of detecting a difference of size d_R when it truly exists.")),
+                0.60, 0.99, 0.80, 0.01
+              ),
+              sliderInput(
+                "pw_d_true",
+                tags$span("True d’ (manual)", info_icon("Used only for the manual N box and the Power vs N plot when expert mode is on. Context d_R is always highlighted on curves.")),
+                0.1, 2.5, 0.8, 0.05
+              ),
+              checkboxGroupInput(
+                "pw_methods", "Compare methods",
+                choices  = c("2AFC","3AFC","Triangle","Tetrad","Duo-Trio","A-not-A"),
+                selected = c("2AFC","Triangle","Tetrad")
+              ),
+              hr(),
+              div(
+                style = "background:#e8f4fd; padding:10px; border-radius:4px; font-size:12px;",
+                tags$b("Min N at context d_R"),
+                tags$span(
+                  style="font-size:10px; color:#888;",
+                  " — uses context alpha (", textOutput("pw_ctx_alpha_label", inline=TRUE), "), not slider"
+                ),
+                br(),
+                pre(class = "stat-pre", textOutput("pw_n_at_dR"))
+              ),
+              br(),
+              conditionalPanel(
+                "input.expert_mode == true",
+                div(
+                  style = "background:#f9f9f9; padding:10px; border-radius:4px; font-size:12px;",
+                  tags$b("Min N at manual d’:"), br(),
+                  pre(class = "stat-pre", textOutput("pw_n_manual"))
+                )
+              )
+            )
+          ),
+          
+          column(
+            width = 9,
+            box(
+              title = "Power Curve — shaded region = d’ < d_R (consumer-relevant zone)",
+              status = "primary", solidHeader = TRUE, width = NULL,
+              plotlyOutput("pw_power_curve", height = "360px"),
+              div(class = "pw-sentence", textOutput("pw_sentence"))
+            ),
+            
+            # Put the N-table directly under the power curve, same column
+            box(
+              title = "Minimum N by d’ target — d_R column highlighted",
+              status = "success", solidHeader = TRUE, width = NULL,
+              DTOutput("pw_n_table")
+            )
+          )
+        ),
+        
+        # Row 3: Power vs N full width
+        fluidRow(
+          column(
+            12,
+            box(
+              title = "Power vs N — at consumer-relevant difference (d_R)",
+              status = "info", solidHeader = TRUE, width = NULL,
+              plotlyOutput("pw_n_curve", height = "260px"),
+              div(class = "pw-sentence", textOutput("pw_n_sentence"))
+            )
+          )
+        )
+      ),
+      
+      # ===================================================
+      # TAB 3 — Decision Strategy
+      # ===================================================
+      tabItem(
+        tabName = "tab3",
+        
+        # Row 1: context banner (full width)
+        fluidRow(
+          column(12, uiOutput("ctx_card_t3"))
+        ),
+        
+        # Row 2: Strategy Inputs (left) + Decision Boundaries (right)
+        fluidRow(
+          column(
+            width = 3,
+            box(
+              title = "Strategy Inputs", status = "warning",
+              solidHeader = TRUE, width = NULL,
+              p(
+                "All three strategies are evaluated against d_R from your Decision Context. The approval probabilities use a smooth logistic function so expected-loss is continuous near boundaries.",
+                style = "font-size:12px; color:#666;"
+              ),
+              hr(),
+              h5(
+                tags$span(
+                  "Loss / Utility Weights",
+                  info_icon(
+                    "Relative costs of the two error types. Adjust to reflect your brand risk vs operational cost trade-off."
+                  )
+                )
+              ),
+              numericInput("ds_cost_miss",  "Cost: missed difference",  value = 8, min = 1, max = 100),
+              numericInput("ds_cost_alarm", "Cost: false alarm",        value = 5, min = 1, max = 100),
+              
+              # NEW: assumed true d' slider for loss-vs-N plot
+              sliderInput(
+                "ds_true_d",
+                "Assumed true d’ for Expected Loss vs N",
+                min   = 0.1,
+                max   = 2.5,
+                value = 0.8,  # or active_ctx()$d_R if you want to initialize at d_R
+                step  = 0.05
+              ),
+              
+              p(
+                "These default to context values. Adjust to explore sensitivity.",
+                style = "font-size:11px; color:#aaa;"
+              ),
+              hr(),
+              conditionalPanel(
+                "input.expert_mode == true",
+                sliderInput(
+                  "ds_bayes_cutoff",
+                  tags$span(
+                    "Bayesian hard cutoff",
+                    info_icon("P(d'<d_R) must exceed this to register as 'Approve' in the decision text.")
+                  ),
+                  0.50, 0.99, 0.80, 0.01
+                )
+              )
+            )
+          ),
+          
+          column(
+            width = 9,
+            box(
+              title = "Decision Boundaries across d’ range", status = "primary",
+              solidHeader = TRUE, width = NULL,
+              plotlyOutput("ds_boundary_plot", height = "360px"),
+              br(),
+              div(
+                class = "info-note",
+                "NHST (red): approves when d’ is not significantly > 0. ",
+                "Equivalence (blue): approves when the CI lies entirely below d_R. ",
+                "Bayesian (green): soft probability that d’ < d_R (flat prior)."
+              )
+            )
+          )
+        ),
+        
+        # Row 3: Strategy Comparison (left) + Current Decision (right)
+        fluidRow(
+          column(
+            width = 7,
+            box(
+              title = "Strategy Comparison", status = "info",
+              solidHeader = TRUE, width = NULL,
+              uiOutput("ds_recommendation_text"),
+              br(),
+              DTOutput("ds_strategy_table")
+            )
+          ),
+          column(
+            width = 5,
+            box(
+              title = "Current Decision at Observed d’", status = "success",
+              solidHeader = TRUE, width = NULL,
+              uiOutput("ds_decision_text")
+            )
+          )
+        ),
+        
+        # Row 4: Expected Loss vs N at bottom (full width)
+        fluidRow(
+          column(
+            width = 12,
+            box(
+              title = "Expected Loss vs N (assumed true d’)",
+              status = "danger", solidHeader = TRUE, width = NULL,
+              plotlyOutput("ds_loss_curve", height = "260px"),
+              div(
+                class = "info-note",
+                "Expected loss vs N assuming the true d’ is set by the slider (relative to d_R) ",
+                "for the active method. Explore smaller or larger true d’ to see how each framework reacts to N."
+              )
+            )
+          )
+        )
+      ),
+      
+      # ===================================================
+      # TAB 4 — Scenario Projector
+      # ===================================================
+      tabItem(tabName = "tab4",
+              fluidRow(column(12, uiOutput("ctx_card_t4"))),
+              fluidRow(
+                column(width = 4,
+                       box(title = "Add Project", status = "warning",
+                           solidHeader = TRUE, width = NULL,
+                           textInput("sp_name",     "Project name",     "Project A"),
+                           selectInput("sp_method", "Method",
+                                       choices  = c("2AFC","3AFC","Triangle","Tetrad","Duo-Trio","A-not-A"),
+                                       selected = "2AFC"),
+                           fluidRow(
+                             column(6, numericInput("sp_n", "Panelists (N)", value = 80, min = 10)),
+                             column(6, numericInput("sp_x", "Correct (X)",   value = 55, min = 0))
+                           ),
+                           selectInput("sp_context", "Decision context",
+                                       choices = setNames(names(CONTEXTS), sapply(CONTEXTS, `[[`, "label")),
+                                       selected = "cost_saving"),
+                           selectInput("sp_importance", "Strategic importance",
+                                       choices = c("High","Medium","Low"), selected = "Medium"),
+                           numericInput("sp_hours", "Panel hours", value = 4, min = 0.5, step = 0.5),
+                           fluidRow(
+                             column(6, actionButton("sp_add",   "Add",   class = "btn-primary btn-block")),
+                             column(6, actionButton("sp_clear", "Clear", class = "btn-danger  btn-block"))
+                           )
+                       )
+                ),
+                column(width = 8,
+                       box(title = "Portfolio Risk Grid", status = "primary",
+                           solidHeader = TRUE, width = NULL,
+                           DTOutput("sp_portfolio_table")),
+                       box(title = "What-If Controls", status = "info",
+                           solidHeader = TRUE, width = NULL,
+                           fluidRow(
+                             column(6, sliderInput("sp_n_boost",     "Increase all N by (%)", 0, 50, 0, 5)),
+                             column(6, sliderInput("sp_alpha_tight", "Tighten \u03b1 to",     0.01, 0.10, 0.05, 0.01))
+                           ),
+                           fluidRow(
+                             column(4,
+                                    box(title = "Total Panel Hours", status = "success",
+                                        solidHeader = TRUE, width = NULL,
+                                        div(class = "num-hero", textOutput("sp_total_hours")))),
+                             column(4,
+                                    box(title = "Tests Below Target Power", status = "danger",
+                                        solidHeader = TRUE, width = NULL,
+                                        div(class = "num-hero", textOutput("sp_underpowered")))),
+                             column(4,
+                                    box(title = "Portfolio Brand Risk\n(High-importance)",
+                                        status = "warning", solidHeader = TRUE, width = NULL,
+                                        div(class = "num-hero", textOutput("sp_brand_risk"))))
+                           )
+                       )
+                )
+              )
+      )
+    )
+  )
+)
+
+# ============================================================
+# SECTION 4 — SERVER
+# ============================================================
+
+server <- function(input, output, session) {
+  
+  # ---- Core reactives ----
+  
+  active_ctx <- reactive(CONTEXTS[[input$context_type]])
+  
+  # Sync cost and power defaults when context changes
+  observeEvent(input$context_type, {
+    ctx <- CONTEXTS[[input$context_type]]
+    updateNumericInput(session, "ds_cost_miss",  value = ctx$cost_miss)
+    updateNumericInput(session, "ds_cost_alarm", value = ctx$cost_alarm)
+    updateSliderInput(session,  "pw_alpha",      value = ctx$alpha)
+    updateSliderInput(session,  "pw_power",      value = ctx$target_power)
+    updateSliderInput(session,  "pw_d_true",     value = ctx$d_R)
+  })
+  
+  observeEvent(input$global_n, updateNumericInput(session, "global_x", max = input$global_n))
+  observeEvent(input$sp_n,     updateNumericInput(session, "sp_x",     max = input$sp_n))
+  
+  cur_test <- reactive(TEST_DATA[[input$global_method]])
+  cur_calc <- reactive(calc_d_prime(input$global_n, input$global_x, cur_test()))
+  cur_ci   <- reactive({
+    cc <- cur_calc(); if (is.na(cc$d_prime)) return(NULL)
+    calc_ci(cc$d_prime, cc$se, cc$pa, input$global_n, cur_test()$pc)
+  })
+  cur_strat <- reactive({
+    cc  <- cur_calc(); ctx <- active_ctx()
+    if (is.na(cc$d_prime)) return(NULL)
+    calc_strategy_table(cc$d_prime, cc$se, ctx$d_R,
+                        ctx$alpha, input$ds_cost_miss, input$ds_cost_alarm)
+  })
+  
+  # Safe method list for power tab
+  pw_methods <- reactive({
+    m <- input$pw_methods
+    if (is.null(m) || length(m) == 0) "2AFC" else m
+  })
+  
+  # ---- Shared context card ----
+  ctx_html <- reactive({
+    ctx <- active_ctx()
+    HTML(paste0(
+      "<div class='ctx-card'>",
+      "<b>Decision Context: ", ctx$label, "</b><br>",
+      "Consumer-relevant difference <b>d_R = ", ctx$d_R, "</b> &nbsp;|&nbsp; ",
+      "\u03b1 = <b>", ctx$alpha, "</b> &nbsp;|&nbsp; ",
+      "Target power = <b>", ctx$target_power * 100, "%</b> &nbsp;|&nbsp; ",
+      "Cost weights: missed diff = <b>", ctx$cost_miss,
+      "</b>, false alarm = <b>", ctx$cost_alarm, "</b><br>",
+      "<span style='color:#555; font-size:12px;'>", ctx$description, "</span>",
+      "</div>"
+    ))
+  })
+  output$ctx_card_t1 <- renderUI(ctx_html())
+  output$ctx_card_t2 <- renderUI(ctx_html())
+  output$ctx_card_t3 <- renderUI(ctx_html())
+  output$ctx_card_t4 <- renderUI(ctx_html())
+  
+  output$sidebar_hint <- renderText({
+    ctx <- active_ctx()
+    paste0(ctx$label, "\nd_R = ", ctx$d_R, "  \u03b1 = ", ctx$alpha,
+           "  Power \u2265 ", ctx$target_power * 100, "%")
+  })
+  
+  # ============================================================
+  # TAB 1
+  # ============================================================
+  
+  output$t1_d_val <- renderText({
+    cc <- cur_calc()
+    if (is.na(cc$d_prime)) "d\u2019 = N/A"
+    else paste0("d\u2019 = ", round(cc$d_prime, 3))
+  })
+  
+  output$t1_verdict <- renderUI({
+    cc  <- cur_calc(); ctx <- active_ctx()
+    v   <- verdict_text(cc$d_prime, if (is.na(cc$se)) 0 else cc$se, ctx$d_R)
+    cls <- paste0("vrd-", v$color)
+    p_below_pct <- if (!is.na(v$p_below)) round(v$p_below * 100, 1) else NA
+    HTML(paste0(
+      "<div class='", cls, "'>",
+      "<span style='font-size:16px; font-weight:700;'>", v$text, "</span><br><br>",
+      if (!is.na(p_below_pct))
+        paste0("<b>P(true d\u2019 &lt; d_R&nbsp;|&nbsp;data)&nbsp;=&nbsp;",
+               p_below_pct, "%</b>",
+               " <span style='font-size:11px; color:#555;'>(flat prior on d\u2019)</span><br><br>")
+      else "",
+      v$detail,
+      "</div>"
+    ))
+  })
+  
+  output$t1_stats <- renderText({
+    cc  <- cur_calc(); ci <- cur_ci(); ctx <- active_ctx()
+    if (is.na(cc$d_prime) || is.null(ci)) return("Check inputs: X must be <= N")
+    paste0(
+      "d'                   = ", round(cc$d_prime, 3), "\n",
+      "SE                   = ", round(cc$se, 3), "\n",
+      "95% CI for d'        = [", round(ci$d_ci[1], 3), " , ", round(ci$d_ci[2], 3), "]\n",
+      "Pa (prop. correct)   = ", round(cc$pa, 3), "\n",
+      "Pd = Pa - Pc         = ", round(ci$pd, 3),
+      "  (prob. of discrimination)\n",
+      "95% CI for Pd        = [", round(ci$pd_ci[1], 3), " , ", round(ci$pd_ci[2], 3), "]\n",
+      "P(d'<d_R) [flat prio]= ", round(pnorm(ctx$d_R, cc$d_prime, cc$se) * 100, 1),
+      "% (d_R = ", ctx$d_R, ")"
+    )
+  })
+  
+  output$t1_method_table <- renderTable({
+    t <- cur_test()
+    pc_frac <- switch(t$test_name,
+                      "3AFC"    = "1/3",
+                      "Triangle"= "1/3",
+                      "Tetrad"  = "1/6",
+                      as.character(t$pc)
+    )
+    data.frame(
+      Characteristic = c("Reference product", "Samples per trial", "Possible sequences",
+                         "Sequence variance", "Memory effect",
+                         "Chance level (Pc) — guessing probability", "Model"),
+      Value = c(t$reference_product, t$samples_per_trial, t$possible_sequences,
+                t$variance_sequence, t$memory_effect,
+                paste0(round(t$pc, 4), "  (", pc_frac, " — 1 in ",
+                       round(1 / t$pc), " by chance)"),
+                t$model)
+    )
+  }, striped = TRUE, hover = TRUE, spacing = "s", width = "100%")
+  
+  output$t1_method_fit <- renderText(METHOD_CONTEXT_FIT[[input$global_method]])
+  
+  output$t1_cognitive <- renderText(cur_test()$cognitive_strategy)
+  
+  output$t1_sdt_plot <- renderPlotly({
+    cc  <- cur_calc(); if (is.na(cc$d_prime)) return(plot_ly())
+    ctx <- active_ctx()
+    td  <- cur_test()
+    d   <- cc$d_prime
+    x   <- seq(-3.5, max(3.5, d + 2.5), 0.04)
+    ym  <- max(dnorm(x, 0, 1))
+    # M1: title reflects whether the SDT picture is exact or a simplification
+    plot_title <- if (td$model == "SDT")
+      paste0("SDT model for A-not-A  (d' = ", round(d, 2), ")")
+    else
+      paste0("Simplified SDT illustration for ", td$test_name,
+             "  (d' = ", round(d, 2), ") — true Thurstonian decision space differs")
+    plot_ly() %>%
+      add_lines(x = x, y = dnorm(x, 0, 1), name = "Noise (reference)",
+                line = list(color = "#3498db", width = 2.5)) %>%
+      add_lines(x = x, y = dnorm(x, d, 1), name = "Signal (test sample)",
+                line = list(color = "#e74c3c", width = 2.5)) %>%
+      add_lines(x = c(ctx$d_R, ctx$d_R), y = c(0, ym * 1.1),
+                name = paste0("Consumer-relevant d_R = ", ctx$d_R),
+                line = list(color = "#8e44ad", dash = "dot", width = 2)) %>%
+      layout(
+        title  = plot_title,
+        xaxis  = list(title = "Sensory Intensity"),
+        yaxis  = list(title = "Density"),
+        showlegend = TRUE,
+        margin = list(t = 40),
+        annotations = list(list(
+          x = d / 2, y = ym * 1.18,
+          text = paste0("d' = ", round(d, 2)), showarrow = FALSE,
+          font = list(size = 13, color = "#333")
+        ))
+      )
+  })
+  
+  output$t1_prior_plot <- renderPlotly({
+    req(input$expert_mode); ctx <- active_ctx()
+    x <- seq(0, 3, 0.02)
+    y <- dnorm(x, input$prior_mean, input$prior_sd)
+    plot_ly() %>%
+      add_lines(x = x, y = y, name = "Prior on d\u2019",
+                line = list(color = "#3498db", width = 2)) %>%
+      add_lines(x = c(ctx$d_R, ctx$d_R), y = c(0, max(y) * 0.95),
+                name = paste0("d_R = ", ctx$d_R),
+                line = list(color = "#8e44ad", dash = "dash", width = 1.5)) %>%
+      layout(xaxis = list(title = "d\u2019"), yaxis = list(title = "Density"),
+             showlegend = FALSE, margin = list(t = 5))
+  })
+  
+  # ================================
+  # TAB 2
+  # ================================
+  
+  # Context alpha label (used in UI note)
+  output$pw_ctx_alpha_label <- renderText(as.character(active_ctx()$alpha))
+  
+  # Min N at context d_R (text block in left panel)
+  output$pw_n_at_dR <- renderText({
+    ctx     <- active_ctx()
+    methods <- pw_methods()
+    out <- sapply(methods, function(m) {
+      n <- calc_min_n(ctx$d_R, m, TEST_DATA[[m]]$pc,
+                      ctx$alpha, ctx$target_power)
+      paste0(m, ": ", if (is.na(n)) ">500" else n)
+    })
+    paste(out, collapse = "\n")
+  })
+  
+  # Min N at manual d' (expert mode text block)
+  output$pw_n_manual <- renderText({
+    methods <- pw_methods()
+    out <- sapply(methods, function(m) {
+      n <- calc_min_n(input$pw_d_true, m, TEST_DATA[[m]]$pc,
+                      input$pw_alpha, input$pw_power)
+      paste0(m, ": ", if (is.na(n)) ">500" else n)
+    })
+    paste(out, collapse = "\n")
+  })
+  
+  # Power curves vs true d'
+  output$pw_power_curve <- renderPlotly({
+    ctx     <- active_ctx()
+    methods <- pw_methods()
+    d_seq   <- seq(0.1, 2.5, 0.04)
+    colors  <- c("#e74c3c","#3498db","#2ecc71",
+                 "#f39c12","#9b59b6","#1abc9c")
+    p <- plot_ly()
+    for (i in seq_along(methods)) {
+      m  <- methods[i]
+      pc <- TEST_DATA[[m]]$pc
+      pw <- sapply(d_seq, function(d)
+        calc_power(input$global_n, d, m, pc, input$pw_alpha))
+      p  <- add_lines(
+        p, x = d_seq, y = pw, name = m,
+        line = list(
+          color = colors[(i - 1) %% length(colors) + 1],
+          width = 2.5
+        )
+      )
+    }
+    p %>%
+      add_lines(
+        x = d_seq, y = rep(input$pw_power, length(d_seq)),
+        name = "Target power",
+        line = list(color = "#333", dash = "dash", width = 1.5)
+      ) %>%
+      add_lines(
+        x = c(ctx$d_R, ctx$d_R), y = c(0, 1),
+        name = paste0("Consumer-relevant d_R = ", ctx$d_R),
+        line = list(color = "#8e44ad", dash = "dot", width = 2)
+      ) %>%
+      layout(
+        xaxis  = list(title = "True d’"),
+        yaxis  = list(title = "Power", range = c(0, 1.05)),
+        title  = paste0("Power curves  (N = ",
+                        input$global_n, ", \u03b1 = ",
+                        input$pw_alpha, ")"),
+        shapes = list(list(
+          type = "rect", x0 = 0, x1 = ctx$d_R, y0 = 0, y1 = 1,
+          fillcolor = "rgba(142,68,173,0.05)",
+          line = list(width = 0)
+        )),
+        annotations = list(list(
+          x = ctx$d_R, y = 1.03,
+          text = paste0("d_R = ", ctx$d_R),
+          showarrow = FALSE,
+          font = list(size = 11, color = "#8e44ad"),
+          xanchor = "left"
+        ))
+      )
+  })
+  
+  # Power sentence under the curve
+  output$pw_sentence <- renderText({
+    ctx     <- active_ctx()
+    methods <- pw_methods()
+    power_sentence(methods, input$global_n, ctx$d_R, input$pw_alpha)
+  })
+  
+  # Minimum N by d' target — table with nicer headers
+  output$pw_n_table <- renderDT({
+    ctx       <- active_ctx()
+    d_targets <- sort(unique(c(ctx$d_R, 0.5, 0.8, 1.0, 1.5)))
+    methods   <- pw_methods()
+    
+    # Build rows: Method + N for each d' target
+    rows <- lapply(methods, function(m) {
+      pc <- TEST_DATA[[m]]$pc
+      ns <- sapply(d_targets, function(d)
+        calc_min_n(d, m, pc, input$pw_alpha, input$pw_power))
+      c(
+        Method = m,
+        setNames(as.list(ifelse(is.na(ns), ">500", as.character(ns))),
+                 paste0("d'=", d_targets))
+      )
+    })
+    
+    df <- as.data.frame(
+      do.call(rbind, lapply(rows, as.data.frame, stringsAsFactors = FALSE)),
+      stringsAsFactors = FALSE
+    )
+    
+    dR_col <- paste0("d'=", ctx$d_R)
+    
+    # Human‑friendly column labels (visible headers)
+    pretty_cols <- c(
+      "Method",
+      paste0("d' = ", d_targets)
+    )
+    
+    dt <- datatable(
+      df,
+      rownames = FALSE,
+      caption  = paste0(
+        "Min N for ", round(input$pw_power * 100),
+        "% power  (\u03b1 = ", input$pw_alpha, ")"
+      ),
+      options  = list(pageLength = 8, dom = "t", scrollX = TRUE),
+      colnames = pretty_cols
+    )
+    
+    # Highlight the column corresponding to d_R
+    if (dR_col %in% names(df)) {
+      dt <- dt %>%
+        formatStyle(
+          dR_col,
+          backgroundColor = "#d6eaf8",
+          fontWeight      = "bold"
+        )
+    }
+    dt
+  })
+  
+  # Power vs N at d_R
+  output$pw_n_curve <- renderPlotly({
+    ctx     <- active_ctx()
+    methods <- pw_methods()
+    n_seq   <- seq(5, 300, 5)
+    colors  <- c("#e74c3c","#3498db","#2ecc71",
+                 "#f39c12","#9b59b6","#1abc9c")
+    p <- plot_ly()
+    for (i in seq_along(methods)) {
+      m  <- methods[i]
+      pc <- TEST_DATA[[m]]$pc
+      pw <- sapply(n_seq, function(n)
+        calc_power(n, ctx$d_R, m, pc, input$pw_alpha))
+      p  <- add_lines(
+        p, x = n_seq, y = pw, name = m,
+        line = list(
+          color = colors[(i - 1) %% length(colors) + 1],
+          width = 2.5
+        )
+      )
+    }
+    p %>%
+      add_lines(
+        x = n_seq, y = rep(input$pw_power, length(n_seq)),
+        name = "Target power",
+        line = list(color = "#333", dash = "dash")
+      ) %>%
+      layout(
+        xaxis = list(title = "N panelists"),
+        yaxis = list(title = "Power", range = c(0, 1.05)),
+        title = paste0(
+          "Power vs N at consumer-relevant d_R = ", ctx$d_R,
+          "  (\u03b1 = ", input$pw_alpha, ")"
+        )
+      )
+  })
+  
+  # Power sentence under the N‑curve (same text as above)
+  output$pw_n_sentence <- renderText({
+    ctx     <- active_ctx()
+    methods <- pw_methods()
+    power_sentence(methods, input$global_n, ctx$d_R, input$pw_alpha)
+  })
+  
+  
+  # ============================================================
+  # TAB 3 — Decision Strategy (server)
+  # ============================================================
+  
+  output$ds_recommendation_text <- renderUI({
+    df <- cur_strat(); if (is.null(df)) return(HTML("—"))
+    ctx <- active_ctx()
+    bs  <- best_strategy_name(df)
+    el  <- df$"Expected Loss"[df$Strategy == bs]
+    pb  <- df$"P(d' < d_R)"[1]   # same for all rows (posterior, flat prior)
+    HTML(paste0(
+      "<div class='best-box'>",
+      "<b>Recommended framework: ", bs, "</b><br>",
+      "Gives lowest expected loss (<b>", round(el, 2), "</b>) under <em>", ctx$label, "</em>.<br>",
+      "P(true d' &lt; d_R&nbsp;|&nbsp;data) = <b>", round(pb * 100, 1),
+      "%</b> <span style='font-size:11px; color:#555;'>(flat prior on d')</span>",
+      "</div>"
+    ))
+  })
+  
+  
+  output$ds_boundary_plot <- renderPlotly({
+    cc  <- cur_calc(); if (is.na(cc$d_prime)) return(plot_ly())
+    ctx <- active_ctx()
+    df  <- cur_strat()
+    bs  <- if (!is.null(df)) best_strategy_name(df) else "—"
+    d   <- cc$d_prime; se <- cc$se
+    d_grid <- seq(0, max(3.5, d + 1.5), 0.03)
+    
+    # CI-based NHST: margin = how far lower 95% CI is above 0 (negate for approval)
+    ci_lo_grid    <- d_grid - qnorm(0.975) * se
+    ci_hi_grid    <- d_grid + qnorm(0.975) * se
+    nhst_margin   <- clamp((ci_lo_grid - 0) / se, -10, 10)
+    nhst_approve  <- plogis(-nhst_margin)            # high when CI lower <= 0
+    
+    # Equivalence (TOST): margin = (d_R - CI_upper)/SE, positive = approved
+    equiv_margin  <- clamp((ctx$d_R - ci_hi_grid) / se, -10, 10)
+    equiv_approve <- plogis(equiv_margin)
+    
+    # Bayesian: P(d' < d_R | data), flat prior
+    bayes_approve <- pnorm(ctx$d_R, mean = d_grid, sd = se)
+    
+    plot_ly() %>%
+      add_lines(x = d_grid, y = nhst_approve,
+                name = "NHST (no sig. diff. from 0)",
+                line = list(color = "#e74c3c", width = 2.5)) %>%
+      add_lines(x = d_grid, y = equiv_approve,
+                name = "Equivalence (CI entirely < d_R)",
+                line = list(color = "#3498db", width = 2.5)) %>%
+      add_lines(x = d_grid, y = bayes_approve,
+                name = "Bayesian P(d' < d_R) — flat prior",
+                line = list(color = "#2ecc71", width = 2.5)) %>%
+      add_lines(x = c(d, d), y = c(-0.05, 1.1),
+                name = paste0("Observed d' = ", round(d, 2)),
+                line = list(color = "#333", dash = "dash", width = 1.5)) %>%
+      add_lines(x = c(ctx$d_R, ctx$d_R), y = c(-0.05, 1.1),
+                name = paste0("Consumer-relevant d_R = ", ctx$d_R),
+                line = list(color = "#8e44ad", dash = "dot", width = 2)) %>%
+      layout(
+        xaxis  = list(title = "d'"),
+        yaxis  = list(title = "P(Approve)", range = c(-0.08, 1.18)),
+        title  = paste0("Decision boundaries  |  SE = ", round(se, 3),
+                        "  |  Current best: ", bs),
+        shapes = list(list(
+          type = "rect", x0 = 0, x1 = ctx$d_R, y0 = -0.08, y1 = 1.1,
+          fillcolor = "rgba(142,68,173,0.05)", line = list(width = 0)
+        )),
+        annotations = list(list(
+          x = ctx$d_R, y = 1.14,
+          text = paste0("d_R = ", ctx$d_R),
+          showarrow = FALSE, font = list(size = 11, color = "#8e44ad"),
+          xanchor = "left"
+        ))
+      )
+  })
+  
+  output$ds_decision_text <- renderUI({
+    cc  <- cur_calc(); if (is.na(cc$d_prime)) return(HTML("—"))
+    ctx <- active_ctx()
+    d   <- cc$d_prime; se <- cc$se
+    ci_lower <- d - qnorm(0.975) * se    # 95% CI lower bound
+    ci_upper <- d + qnorm(0.975) * se    # 95% CI upper bound
+    p_below  <- pnorm(ctx$d_R, d, se)    # flat prior posterior
+    cutoff   <- if (isTRUE(input$expert_mode)) input$ds_bayes_cutoff else 0.80
+    
+    # Smooth NHST approval probability
+    nhst_smooth_pct <- round(plogis(-clamp((ci_lower - 0) / se, -10, 10)) * 100, 1)
+    
+    # NHST text
+    nhst_dec  <- if (ci_lower <= 0)
+      paste0("✅ APPROVE — lower 95% CI does not exceed 0 (no significant difference)",
+             " <span style='font-size:11px; color:#888;'>[smooth P(Approve) = ",
+             nhst_smooth_pct, "% — matches strategy table]</span>")
+    else
+      paste0("❌ REJECT — lower CI (", round(ci_lower, 2),
+             ") > 0; significant difference detected",
+             " <span style='font-size:11px; color:#888;'>[smooth P(Approve) = ",
+             nhst_smooth_pct, "% — matches strategy table]</span>")
+    
+    # Equivalence (TOST)
+    equiv_smooth_pct <- round(plogis(clamp((ctx$d_R - ci_upper) / se, -10, 10)) * 100, 1)
+    equiv_dec <- if (ci_upper < ctx$d_R)
+      paste0("✅ APPROVE  — CI upper (", round(ci_upper, 2),
+             ") < d_R (", ctx$d_R, "): difference within consumer tolerance",
+             " <span style='font-size:11px; color:#888;'>[P(Approve) = ",
+             equiv_smooth_pct, "%]</span>")
+    else paste0("❌ REJECT  — CI upper (",
+                round(ci_upper, 2), ") >= d_R (", ctx$d_R,
+                "): cannot rule out consumer-relevant difference",
+                " <span style='font-size:11px; color:#888;'>[P(Approve) = ",
+                equiv_smooth_pct, "%]</span>")
+    
+    # Bayesian: three zones (Approve / Borderline / Reject)
+    bayes_dec <- if (p_below > cutoff) {
+      paste0(
+        "✅ APPROVE — P(d' < d_R | data, flat prior) = ",
+        round(p_below * 100, 1), "% (≥ ", round(cutoff * 100, 0), "% cutoff)."
+      )
+    } else if (p_below > 0.5) {
+      paste0(
+        "⚠️ BORDERLINE — P(d' < d_R | data, flat prior) = ",
+        round(p_below * 100, 1), "% (< ", round(cutoff * 100, 0),
+        "% cutoff). More data needed."
+      )
+    } else {
+      paste0(
+        "❌ REJECT — P(d' < d_R | data, flat prior) = ",
+        round(p_below * 100, 1), "% (< 50%, effect likely ≥ d_R)."
+      )
+    }
+    
+    HTML(paste0(
+      "<div style='font-size:13px; line-height:2.4;'>",
+      "<b>NHST:</b> ", nhst_dec, "<br>",
+      "<span style='font-size:11px; color:#888;'>Tests departure from zero only — d_R is irrelevant here. Approval = not significant.</span><br>",
+      "<b>Equivalence (TOST):</b> ", equiv_dec, "<br>",
+      "<span style='font-size:11px; color:#888;'>Approves only when the entire 95% CI lies below the consumer-relevant threshold d_R.</span><br>",
+      "<b>Bayesian:</b> ", bayes_dec, "<br>",
+      "<span style='font-size:11px; color:#888;'>Probability the true d' is smaller than d_R, given the data and a flat (uninformative) prior on d'.</span>",
+      "</div>"
+    ))
+  })
+  
+  output$ds_strategy_table <- renderDT({
+    df <- cur_strat(); if (is.null(df)) return(datatable(data.frame()))
+    bs <- best_strategy_name(df)
+    df$Rec <- ifelse(df$Strategy == bs, "★ Best", "")
+    datatable(
+      df, rownames = FALSE,
+      options = list(dom = "t", pageLength = 5),
+      colnames = c(
+        "Strategy",
+        "P(d'<d_R) [flat prior]",
+        "P(Approve)",
+        "P(App.&Diff)",
+        "P(Rej.&Sim)",
+        "Exp. Loss",
+        ""
+      )
+    ) %>%
+      formatStyle(
+        "Expected Loss",
+        background = styleColorBar(
+          c(0, max(df$`Expected Loss`, 0.1)), "#fadbd8"
+        )
+      ) %>%
+      formatStyle("Rec", color = "#1e8449", fontWeight = "bold") %>%
+      formatStyle(
+        "Strategy",
+        fontWeight = styleEqual(bs, "bold"),
+        backgroundColor = styleEqual(bs, "#d5f5e3")
+      )
+  })
+  
+  # expected loss vs N at assumed true d′
+  output$ds_loss_curve <- renderPlotly({
+    ctx    <- active_ctx()
+    method <- input$global_method
+    n_seq  <- seq(10, 250, 5)
+    colors <- c("#e74c3c", "#3498db", "#2ecc71")
+    
+    pc <- TEST_DATA[[method]]$pc
+    
+    # Use slider value for the simulation, not necessarily d_R
+    true_d <- input$ds_true_d
+    if (is.null(true_d) || is.na(true_d)) true_d <- ctx$d_R
+    
+    # True pa at the assumed true d'
+    pa_true <- pa_from_d(true_d, method, pc)
+    
+    p <- plot_ly()
+    for (i in seq_along(STRAT_NAMES)) {
+      s <- STRAT_NAMES[i]
+      losses <- sapply(n_seq, function(n) {
+        # Deterministic "typical" dataset at true_d: X = pa_true * N
+        x_det <- pa_true * n
+        cc2   <- calc_d_prime(n, x_det, TEST_DATA[[method]])
+        if (is.na(cc2$d_prime)) return(NA)
+        df2 <- calc_strategy_table(
+          cc2$d_prime, cc2$se, ctx$d_R,   # still evaluate loss vs d_R
+          ctx$alpha, input$ds_cost_miss, input$ds_cost_alarm
+        )
+        df2$`Expected Loss`[df2$Strategy == s]
+      })
+      p <- add_lines(
+        p, x = n_seq, y = losses, name = s,
+        line = list(color = colors[i], width = 2)
+      )
+    }
+    
+    p %>%
+      layout(
+        xaxis  = list(title = "N panelists"),
+        yaxis  = list(title = "Expected Loss"),
+        margin = list(t = 10)
+      )
+  })
+  
+  
+  
+  
+  # ============================================================
+  # TAB 4 — Scenario Projector
+  # ============================================================
+  
+  portfolio <- reactiveVal(
+    data.frame(
+      Project = character(), Method = character(), Context_key = character(),
+      Context_label = character(), N = integer(), X = integer(),
+      d_R = numeric(), Alpha = numeric(), TargetPower = numeric(),
+      CostMiss = numeric(), CostAlarm = numeric(),
+      Importance = character(), Hours = numeric(),
+      d_prime = numeric(), Power_pct = numeric(),
+      P_below_dR = numeric(), Exp_Loss = numeric(),
+      stringsAsFactors = FALSE
+    )
+  )
+  
+  observeEvent(input$sp_add, {
+    m   <- input$sp_method
+    n   <- input$sp_n
+    x   <- input$sp_x
+    ck  <- input$sp_context
+    ctx <- CONTEXTS[[ck]]
+    td  <- TEST_DATA[[m]]
+    cc  <- calc_d_prime(n, x, td)
+    pw  <- calc_power(n, ctx$d_R, m, td$pc, ctx$alpha)
+    p_below <- if (!is.na(cc$d_prime)) pnorm(ctx$d_R, cc$d_prime, cc$se) else NA
+    el <- if (!is.na(cc$d_prime)) {
+      df_s <- calc_strategy_table(cc$d_prime, cc$se, ctx$d_R,
+                                  ctx$alpha, ctx$cost_miss, ctx$cost_alarm)
+      bs   <- best_strategy_name(df_s)
+      df_s$`Expected Loss`[df_s$Strategy == bs]
+    } else NA
+    
+    portfolio(rbind(portfolio(), data.frame(
+      Project = input$sp_name, Method = m, Context_key = ck,
+      Context_label = ctx$label, N = n, X = x,
+      d_R = ctx$d_R, Alpha = ctx$alpha, TargetPower = ctx$target_power,
+      CostMiss = ctx$cost_miss, CostAlarm = ctx$cost_alarm,
+      Importance = input$sp_importance, Hours = input$sp_hours,
+      d_prime = if (!is.na(cc$d_prime)) round(cc$d_prime, 3) else NA,
+      Power_pct = round(pw * 100, 1),
+      P_below_dR = if (!is.na(p_below)) round(p_below, 3) else NA,
+      Exp_Loss   = if (!is.na(el))      round(el, 2)       else NA,
+      stringsAsFactors = FALSE
+    )))
+  })
+  
+  observeEvent(input$sp_clear, portfolio(
+    data.frame(
+      Project = character(), Method = character(), Context_key = character(),
+      Context_label = character(), N = integer(), X = integer(),
+      d_R = numeric(), Alpha = numeric(), TargetPower = numeric(),
+      CostMiss = numeric(), CostAlarm = numeric(),
+      Importance = character(), Hours = numeric(),
+      d_prime = numeric(), Power_pct = numeric(),
+      P_below_dR = numeric(), Exp_Loss = numeric(),
+      stringsAsFactors = FALSE
+    )
+  ))
+  
+  adj_portfolio <- reactive({
+    df <- portfolio(); if (nrow(df) == 0) return(df)
+    df$N_adj <- ceiling(df$N * (1 + input$sp_n_boost / 100))
+    for (i in seq_len(nrow(df))) {
+      m   <- df$Method[i]; td <- TEST_DATA[[m]]
+      n2  <- df$N_adj[i];  a2 <- input$sp_alpha_tight
+      d_r <- df$d_R[i]
+      # H3 fix: N-boost is a prospective power question.
+      # We ask: "if we ran n2 panelists, what power would we have at d_R?"
+      # d' and P_below_dR are properties of the OBSERVED data (original N, X)
+      # and do not change when we hypothetically increase N.
+      # Only Power_pct is recomputed with the boosted N.
+      df$Power_pct[i] <- round(calc_power(n2, d_r, m, td$pc, a2) * 100, 1)
+      # d_prime and P_below_dR remain as stored from sp_add (original N and X)
+      # Exp_Loss also stays fixed — it reflects the current data's uncertainty
+    }
+    # Status: Green = prospective power >= target AND observed P(d'<d_R) >= 0.80
+    #         Amber = power OK but P(d'<d_R) between 0.60–0.80
+    #         Red   = underpowered OR P(d'<d_R) < 0.60
+    df$Status <- mapply(function(pw, pb, tp) {
+      if (is.na(pw) || is.na(pb)) return("\U0001F534 No data")
+      if (pw >= tp * 100 && pb >= 0.80) "\u2705 Low risk"
+      else if (pw >= tp * 100 && pb >= 0.60) "\u26A0\uFE0F Moderate risk"
+      else "\U0001F534 High risk"
+    }, df$Power_pct, df$P_below_dR, df$TargetPower)
+    df
+  })
+  
+  output$sp_portfolio_table <- renderDT({
+    df <- adj_portfolio()
+    if (nrow(df) == 0) return(datatable(data.frame(Note = "No projects added yet.")))
+    display <- df[, c("Project","Method","Context_label","N_adj","d_R",
+                      "d_prime","Power_pct","P_below_dR","Exp_Loss",
+                      "Importance","Hours","Status")]
+    names(display) <- c(
+      "Project", "Method", "Decision Context",
+      "N (adjusted)", "Consumer-relevant diff. (d_R)",
+      "Observed d'", "Power at d_R (%)", "Brand safety score",
+      "Brand risk (exp. loss)", "Strategic importance",
+      "Panel hours", "Risk status"
+    )
+    datatable(display, rownames = FALSE,
+              options = list(pageLength = 10, scrollX = TRUE, dom = "tp")) %>%
+      formatStyle("Risk status",
+                  backgroundColor = styleEqual(
+                    c("\u2705 Low risk","\u26A0\uFE0F Moderate risk",
+                      "\U0001F534 High risk","\U0001F534 No data"),
+                    c("#dff0d8","#fcf8e3","#f2dede","#f5f5f5"))) %>%
+      formatStyle("Power at d_R (%)",
+                  color = styleInterval(c(60, 80), c("#cc0000","#cc6600","#2e7d32")),
+                  fontWeight = "bold") %>%
+      formatStyle("Brand safety score",
+                  color = styleInterval(c(0.60, 0.80), c("#cc0000","#cc6600","#2e7d32")))
+  })
+  
+  output$sp_total_hours <- renderText({
+    df <- adj_portfolio()
+    if (nrow(df) == 0) return("0 hrs")
+    paste0(sum(df$Hours, na.rm = TRUE), " hrs")
+  })
+  
+  output$sp_underpowered <- renderText({
+    df <- adj_portfolio(); if (nrow(df) == 0) return("0")
+    as.character(sum(df$Power_pct < df$TargetPower * 100, na.rm = TRUE))
+  })
+  
+  output$sp_brand_risk <- renderText({
+    df <- adj_portfolio(); if (nrow(df) == 0) return("—")
+    hi <- df[df$Importance == "High", ]
+    if (nrow(hi) == 0) return("0")
+    as.character(round(sum(hi$Exp_Loss, na.rm = TRUE), 1))
+  })
+}
+
+shinyApp(ui = ui, server = server)
